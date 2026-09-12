@@ -273,6 +273,22 @@ async def category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== ЕДИНЫЙ ОБРАБОТЧИК ТЕКСТА ====================
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Защита: реагируем только на обычные новые текстовые сообщения.
+    # update.message может быть None для других типов апдейтов
+    # (например, edited_message) — раньше это привело бы к ошибке
+    # без ответа пользователю. Явно не проверяем и не требуем,
+    # чтобы сообщение было ответом (reply) — ловим любое обычное
+    # следующее сообщение от пользователя.
+    if not update.message or not update.message.text:
+        return
+
+    logger.info(
+        "Текст от user_id=%s: %r (awaiting_amount=%s)",
+        update.effective_user.id if update.effective_user else None,
+        update.message.text,
+        context.user_data.get("awaiting_amount"),
+    )
+
     text = update.message.text.strip()
 
     if text == "💸 Расход":
@@ -325,12 +341,17 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== СБОРКА ПРИЛОЖЕНИЯ TELEGRAM ====================
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Ошибка при обработке апдейта %s:", update, exc_info=context.error)
+
+
 def build_application() -> Application:
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(category_chosen, pattern=r"^(cat_exp|cat_inc):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    app.add_error_handler(error_handler)
     return app
 
 
