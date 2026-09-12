@@ -17,8 +17,6 @@ import sqlite3
 import logging
 from datetime import datetime, date
 
-from aiohttp import web
-
 from telegram import (
     Update,
     InlineKeyboardMarkup,
@@ -393,23 +391,6 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_history(update.message, update.effective_user.id)
 
 
-# ==================== HEALTHCHECK ДЛЯ RAILWAY ====================
-
-async def healthz(request):
-    return web.Response(text="OK")
-
-
-async def start_healthcheck_server():
-    app = web.Application()
-    app.router.add_get("/healthz", healthz)
-    app.router.add_get("/", healthz)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info("Healthcheck server started on port %s", PORT)
-
-
 # ==================== ЗАПУСК ====================
 
 def build_application() -> Application:
@@ -425,9 +406,11 @@ def build_application() -> Application:
     return app
 
 
-async def run_webhook():
+def main():
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
+
+    init_db()
 
     app = build_application()
 
@@ -443,23 +426,17 @@ async def run_webhook():
 
     logger.info("Starting webhook at %s", webhook_url)
 
-    # Запускаем healthcheck-сервер параллельно
-    await start_healthcheck_server()
-
-    # run_webhook сам поднимает aiohttp-сервер и регистрирует webhook в Telegram
-    await app.run_webhook(
+    # ВАЖНО:
+    # - run_webhook вызывается БЕЗ await и БЕЗ asyncio.run.
+    # - Это синхронный метод, он сам создаёт и держит event loop.
+    # - Он же слушает порт PORT — отдельный healthcheck-сервер НЕ нужен.
+    app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=WEBHOOK_PATH,
         webhook_url=webhook_url,
         drop_pending_updates=True,
     )
-
-
-def main():
-    init_db()
-    import asyncio
-    asyncio.run(run_webhook())
 
 
 if __name__ == "__main__":
