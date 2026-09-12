@@ -9,13 +9,14 @@
 - Порт — из PORT.
 - База — по пути DB_PATH (по умолчанию /data/expenses.db, если смонтирован volume;
   иначе ./expenses.db).
+- Часовой пояс — TZ_OFFSET (по умолчанию 3, Москва).
 """
 
 import os
 import re
 import sqlite3
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 
 from telegram import (
     Update,
@@ -45,6 +46,11 @@ DB_PATH = os.environ.get("DB_PATH", "/data/expenses.db")
 if not os.path.isdir(os.path.dirname(DB_PATH)):
     DB_PATH = "expenses.db"
 
+# Часовой пояс для отображения и фильтрации по дате.
+# По умолчанию UTC+3 (Москва). Задаётся переменной окружения TZ_OFFSET.
+TZ_OFFSET = int(os.environ.get("TZ_OFFSET", "3"))
+LOCAL_TZ = timezone(timedelta(hours=TZ_OFFSET))
+
 EXPENSE_CATEGORIES = ["Еда", "Транспорт", "Жильё", "Развлечения", "Здоровье", "Другое"]
 INCOME_CATEGORIES = ["Зарплата", "Подработка", "Подарок", "Прочее"]
 
@@ -53,6 +59,18 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+# ==================== ВРЕМЯ ====================
+
+def now_local() -> datetime:
+    """Текущее время в локальном часовом поясе."""
+    return datetime.now(LOCAL_TZ)
+
+
+def today_local() -> date:
+    """Текущая дата в локальном часовом поясе."""
+    return now_local().date()
 
 
 # ==================== БАЗА ДАННЫХ ====================
@@ -82,18 +100,18 @@ def add_record(user_id: int, rtype: str, category: str, amount: float):
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO records (user_id, type, category, amount, created_at) VALUES (?, ?, ?, ?, ?)",
-        (user_id, rtype, category, amount, datetime.now().isoformat()),
+        (user_id, rtype, category, amount, now_local().isoformat()),
     )
     conn.commit()
     conn.close()
     logger.info(
-        "DB INSERT user_id=%s type=%s category=%s amount=%s",
-        user_id, rtype, category, amount,
+        "DB INSERT user_id=%s type=%s category=%s amount=%s at %s",
+        user_id, rtype, category, amount, now_local().isoformat(),
     )
 
 
 def get_today_records(user_id: int):
-    today_str = date.today().isoformat()
+    today_str = today_local().isoformat()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -103,6 +121,10 @@ def get_today_records(user_id: int):
     )
     rows = cur.fetchall()
     conn.close()
+    logger.info(
+        "DB SELECT user_id=%s date=%s rows=%s",
+        user_id, today_str, len(rows),
+    )
     return rows
 
 
@@ -145,10 +167,7 @@ def clear_state(context: ContextTypes.DEFAULT_TYPE):
 # ==================== ВСПОМОГАТЕЛЬНОЕ ====================
 
 async def safe_edit(query, text, reply_markup=None, parse_mode=None):
-    """
-    Безопасно редактирует сообщение.
-    Если текст не изменился или сообщение уже удалено — не падаем.
-    """
+    """Безопасно редактирует сообщение. Не падает, если текст не изменился."""
     try:
         await query.edit_message_text(
             text,
@@ -248,16 +267,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- Итог ---
+    # ВАЖНО: НЕ редактируем старое сообщение, а отвечаем новым.
+    # Иначе при повторном нажатии на уже отредактированное сообщение
+    # Telegram вернёт BadRequest, и пользователь не увидит ответа.
     if data == "summary":
         await query.answer()
-        await safe_edit(query, "Главное меню:", reply_markup=main_menu_keyboard())
         await send_summary(query.message, user_id)
         return
 
     # --- История ---
     if data == "history":
         await query.answer()
-        await safe_edit(query, "Главное меню:", reply_markup=main_menu_keyboard())
         await send_history(query.message, user_id)
         return
 
@@ -344,17 +364,30 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=main_menu_keyboard(),
                 )
                 return
+            else:
+                # Ответ на сообщение бота, но это не запрос суммы.
+                await update.message.reply_text(
+                    "Чтобы начать, нажми /menu.",
+                    reply_markup=main_menu_keyboard(),
+                )
+                return
 
-    # --- Случай 3: болтовня ---
+    # --- Случай 3: обычное сообщение ---
     if chat_type == "private":
-        await update.message.reply_text("Чтобы начать, нажми /menu.")
-    # в группе молчим
+        await update.message.reply_text(
+            "Чтобы начать, нажми /menu.",
+            reply_markup=main_menu_keyboard(),
+        )
+    # в группе молчим, чтобы не спамить
 
 
 async def send_summary(message, user_id: int):
     rows = get_today_records(user_id)
     if not rows:
-        await message.reply_text("Сегодня записей ещё нет.")
+        await message.reply_text(
+            f"Сегодня ({today_local().strftime('%d.%m.%Y')}) записей ещё нет.",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
     total_expense = 0.0
@@ -371,7 +404,7 @@ async def send_summary(message, user_id: int):
             income_by_cat[category] = income_by_cat.get(category, 0) + amount
 
     balance = total_income - total_expense
-    lines = [f"📊 <b>Итог за {date.today().strftime('%d.%m.%Y')}</b>\n"]
+    lines = [f"📊 <b>Итог за {today_local().strftime('%d.%m.%Y')}</b>\n"]
     lines.append(f"💰 Доходы: <b>{total_income:.2f}</b>")
     for cat, amt in sorted(income_by_cat.items(), key=lambda x: -x[1]):
         lines.append(f"   • {cat}: {amt:.2f}")
@@ -380,13 +413,20 @@ async def send_summary(message, user_id: int):
         lines.append(f"   • {cat}: {amt:.2f}")
     lines.append(f"\n⚖️ Баланс за день: <b>{balance:+.2f}</b>")
 
-    await message.reply_text("\n".join(lines), parse_mode="HTML")
+    await message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def send_history(message, user_id: int):
     rows = get_today_records(user_id)
     if not rows:
-        await message.reply_text("Сегодня записей ещё нет.")
+        await message.reply_text(
+            f"Сегодня ({today_local().strftime('%d.%m.%Y')}) записей ещё нет.",
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
     lines = ["🧾 <b>История за сегодня:</b>\n"]
@@ -396,7 +436,11 @@ async def send_history(message, user_id: int):
         sign = "-" if rtype == "expense" else "+"
         lines.append(f"{t}  {emoji} {sign}{amount:.2f}  ({category})")
 
-    await message.reply_text("\n".join(lines), parse_mode="HTML")
+    await message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -441,6 +485,7 @@ def main():
         )
 
     logger.info("Starting webhook at %s", webhook_url)
+    logger.info("Timezone offset: UTC+%s", TZ_OFFSET)
 
     # run_webhook — синхронный, сам управляет event loop.
     app.run_webhook(
