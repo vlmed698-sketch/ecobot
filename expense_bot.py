@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Телеграм-бот для учёта доходов и расходов за день.
-Работает и в личке, и в группах.
+Поддерживает И inline-кнопки, И Reply-клавиатуру (нижнюю).
 
 Деплой на Railway:
-- Токен берётся из переменной окружения TELEGRAM_BOT_TOKEN.
-- Публичный домен — из RAILWAY_PUBLIC_DOMAIN.
-- Порт — из PORT.
-- База — по пути DB_PATH (по умолчанию /data/expenses.db, если смонтирован volume;
-  иначе ./expenses.db).
-- Часовой пояс — TZ_OFFSET (по умолчанию 3, Москва).
+- TELEGRAM_BOT_TOKEN — токен бота
+- RAILWAY_PUBLIC_DOMAIN — домен Railway (подставляется автоматически)
+- PORT — порт (подставляется автоматически)
+- DB_PATH — путь к SQLite (по умолчанию /data/expenses.db)
+- TZ_OFFSET — часовой пояс (по умолчанию 3, Москва)
 """
 
 import os
@@ -22,6 +21,9 @@ from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application,
@@ -46,13 +48,19 @@ DB_PATH = os.environ.get("DB_PATH", "/data/expenses.db")
 if not os.path.isdir(os.path.dirname(DB_PATH)):
     DB_PATH = "expenses.db"
 
-# Часовой пояс для отображения и фильтрации по дате.
-# По умолчанию UTC+3 (Москва). Задаётся переменной окружения TZ_OFFSET.
 TZ_OFFSET = int(os.environ.get("TZ_OFFSET", "3"))
 LOCAL_TZ = timezone(timedelta(hours=TZ_OFFSET))
 
 EXPENSE_CATEGORIES = ["Еда", "Транспорт", "Жильё", "Развлечения", "Здоровье", "Другое"]
 INCOME_CATEGORIES = ["Зарплата", "Подработка", "Подарок", "Прочее"]
+
+# Тексты Reply-кнопок
+BTN_EXPENSE = "💸 Расход"
+BTN_INCOME = "💰 Доход"
+BTN_SUMMARY = "📊 Итог за сегодня"
+BTN_HISTORY = "🧾 История за сегодня"
+
+REPLY_BUTTONS = {BTN_EXPENSE, BTN_INCOME, BTN_SUMMARY, BTN_HISTORY}
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -64,12 +72,10 @@ logger = logging.getLogger(__name__)
 # ==================== ВРЕМЯ ====================
 
 def now_local() -> datetime:
-    """Текущее время в локальном часовом поясе."""
     return datetime.now(LOCAL_TZ)
 
 
 def today_local() -> date:
-    """Текущая дата в локальном часовом поясе."""
     return now_local().date()
 
 
@@ -105,8 +111,8 @@ def add_record(user_id: int, rtype: str, category: str, amount: float):
     conn.commit()
     conn.close()
     logger.info(
-        "DB INSERT user_id=%s type=%s category=%s amount=%s at %s",
-        user_id, rtype, category, amount, now_local().isoformat(),
+        "DB INSERT user_id=%s type=%s category=%s amount=%s",
+        user_id, rtype, category, amount,
     )
 
 
@@ -130,7 +136,19 @@ def get_today_records(user_id: int):
 
 # ==================== КЛАВИАТУРЫ ====================
 
+def reply_keyboard():
+    """Нижняя Reply-клавиатура."""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BTN_EXPENSE), KeyboardButton(BTN_INCOME)],
+            [KeyboardButton(BTN_SUMMARY), KeyboardButton(BTN_HISTORY)],
+        ],
+        resize_keyboard=True,
+    )
+
+
 def main_menu_keyboard():
+    """Inline-клавиатура под сообщением."""
     return InlineKeyboardMarkup(
         [
             [
@@ -154,7 +172,7 @@ def categories_keyboard(categories, prefix):
     return InlineKeyboardMarkup(rows)
 
 
-# ==================== СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ ====================
+# ==================== СОСТОЯНИЕ ====================
 
 def get_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
     return context.user_data
@@ -164,10 +182,7 @@ def clear_state(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
 
-# ==================== ВСПОМОГАТЕЛЬНОЕ ====================
-
 async def safe_edit(query, text, reply_markup=None, parse_mode=None):
-    """Безопасно редактирует сообщение. Не падает, если текст не изменился."""
     try:
         await query.edit_message_text(
             text,
@@ -178,12 +193,78 @@ async def safe_edit(query, text, reply_markup=None, parse_mode=None):
         logger.info("edit_message_text skipped: %s", e)
 
 
+# ==================== ЛОГИКА ДЕЙСТВИЙ (общая для inline и reply) ====================
+
+async def action_start_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начать ввод расхода. Работает и из inline, и из reply."""
+    clear_state(context)
+    context.user_data["record_type"] = "expense"
+    context.user_data["stage"] = "choosing_category"
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await safe_edit(
+            update.callback_query,
+            "На что потрачено? Выбери категорию:",
+            reply_markup=categories_keyboard(EXPENSE_CATEGORIES, "cat_exp"),
+        )
+    else:
+        await update.message.reply_text(
+            "На что потрачено? Выбери категорию:",
+            reply_markup=categories_keyboard(EXPENSE_CATEGORIES, "cat_exp"),
+        )
+
+
+async def action_start_income(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_state(context)
+    context.user_data["record_type"] = "income"
+    context.user_data["stage"] = "choosing_category"
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await safe_edit(
+            update.callback_query,
+            "Откуда доход? Выбери категорию:",
+            reply_markup=categories_keyboard(INCOME_CATEGORIES, "cat_inc"),
+        )
+    else:
+        await update.message.reply_text(
+            "Откуда доход? Выбери категорию:",
+            reply_markup=categories_keyboard(INCOME_CATEGORIES, "cat_inc"),
+        )
+
+
+async def action_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать итог. Работает и из inline, и из reply."""
+    user_id = update.effective_user.id
+    if update.callback_query:
+        await update.callback_query.answer()
+        target = update.callback_query.message
+    else:
+        target = update.message
+    await send_summary(target, user_id)
+
+
+async def action_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if update.callback_query:
+        await update.callback_query.answer()
+        target = update.callback_query.message
+    else:
+        target = update.message
+    await send_history(target, user_id)
+
+
 # ==================== ОБРАБОТЧИКИ ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я помогу считать расходы и доходы за день.\n\n"
-        "Выбери действие:",
+        "Используй кнопки внизу или inline-кнопки в сообщении:",
+        reply_markup=reply_keyboard(),
+    )
+    await update.message.reply_text(
+        "Или нажми кнопку здесь:",
         reply_markup=main_menu_keyboard(),
     )
 
@@ -191,6 +272,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Главное меню:",
+        reply_markup=reply_keyboard(),
+    )
+    await update.message.reply_text(
+        "Или inline:",
         reply_markup=main_menu_keyboard(),
     )
 
@@ -203,47 +288,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info("CALLBACK user_id=%s data=%s state=%s", user_id, data, dict(state))
 
-    # --- Отмена ---
     if data == "cancel":
         clear_state(context)
         await query.answer("Отменено")
         await safe_edit(query, "Отменено. Нажми /menu, чтобы начать заново.")
         return
 
-    # --- Меню ---
     if data == "menu":
         clear_state(context)
         await query.answer()
         await safe_edit(query, "Главное меню:", reply_markup=main_menu_keyboard())
         return
 
-    # --- Начать расход ---
     if data == "start_expense":
-        clear_state(context)
-        state["record_type"] = "expense"
-        state["stage"] = "choosing_category"
-        await query.answer()
-        await safe_edit(
-            query,
-            "На что потрачено? Выбери категорию:",
-            reply_markup=categories_keyboard(EXPENSE_CATEGORIES, "cat_exp"),
-        )
+        await action_start_expense(update, context)
         return
 
-    # --- Начать доход ---
     if data == "start_income":
-        clear_state(context)
-        state["record_type"] = "income"
-        state["stage"] = "choosing_category"
-        await query.answer()
-        await safe_edit(
-            query,
-            "Откуда доход? Выбери категорию:",
-            reply_markup=categories_keyboard(INCOME_CATEGORIES, "cat_inc"),
-        )
+        await action_start_income(update, context)
         return
 
-    # --- Выбор категории ---
     if data.startswith("cat_exp:") or data.startswith("cat_inc:"):
         if state.get("stage") != "choosing_category":
             await query.answer("Начни заново: /menu", show_alert=True)
@@ -263,30 +327,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]]
             ),
         )
-        logger.info("PROMPT sent to user_id=%s, msg_id=%s", user_id, query.message.message_id)
+        logger.info("PROMPT sent to user_id=%s", user_id)
         return
 
-    # --- Итог ---
-    # ВАЖНО: НЕ редактируем старое сообщение, а отвечаем новым.
-    # Иначе при повторном нажатии на уже отредактированное сообщение
-    # Telegram вернёт BadRequest, и пользователь не увидит ответа.
     if data == "summary":
-        await query.answer()
-        await send_summary(query.message, user_id)
+        await action_summary(update, context)
         return
 
-    # --- История ---
     if data == "history":
-        await query.answer()
-        await send_history(query.message, user_id)
+        await action_history(update, context)
         return
 
-    # --- Неизвестная кнопка (устаревшая от прошлой версии бота) ---
     logger.warning("UNKNOWN callback data=%s user_id=%s", data, user_id)
-    await query.answer(
-        "Кнопка устарела. Открой /menu заново.",
-        show_alert=True,
-    )
+    await query.answer("Кнопка устарела. Открой /menu заново.", show_alert=True)
 
 
 def try_parse_amount(text: str):
@@ -305,7 +358,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     chat_type = update.effective_chat.type
-    text = update.message.text
+    text = update.message.text.strip()
     state = get_state(context)
 
     logger.info(
@@ -313,9 +366,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id, chat_type, text, dict(state),
     )
 
+    # --- 0. Reply-кнопки главного меню ---
+    if text == BTN_EXPENSE:
+        await action_start_expense(update, context)
+        return
+    if text == BTN_INCOME:
+        await action_start_income(update, context)
+        return
+    if text == BTN_SUMMARY:
+        await action_summary(update, context)
+        return
+    if text == BTN_HISTORY:
+        await action_history(update, context)
+        return
+
     amount = try_parse_amount(text)
 
-    # --- Случай 1: активный шаг ввода суммы ---
+    # --- 1. Активный шаг ввода суммы ---
     if state.get("stage") == "entering_amount":
         if amount is None:
             await update.message.reply_text(
@@ -333,11 +400,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"{emoji} {label} записан: <b>{amount:.2f}</b> ({category})",
             parse_mode="HTML",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=reply_keyboard(),
         )
         return
 
-    # --- Случай 2: reply на сообщение-запрос бота ---
+    # --- 2. reply на сообщение-запрос бота ---
     if amount is not None and update.message.reply_to_message:
         replied = update.message.reply_to_message
         me = await context.bot.get_me()
@@ -361,24 +428,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     f"{emoji} {label} записан: <b>{amount:.2f}</b> ({category})",
                     parse_mode="HTML",
-                    reply_markup=main_menu_keyboard(),
+                    reply_markup=reply_keyboard(),
                 )
                 return
             else:
-                # Ответ на сообщение бота, но это не запрос суммы.
                 await update.message.reply_text(
                     "Чтобы начать, нажми /menu.",
-                    reply_markup=main_menu_keyboard(),
+                    reply_markup=reply_keyboard(),
                 )
                 return
 
-    # --- Случай 3: обычное сообщение ---
+    # --- 3. Обычное сообщение ---
     if chat_type == "private":
         await update.message.reply_text(
             "Чтобы начать, нажми /menu.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=reply_keyboard(),
         )
-    # в группе молчим, чтобы не спамить
+    # в группе молчим
 
 
 async def send_summary(message, user_id: int):
@@ -487,7 +553,6 @@ def main():
     logger.info("Starting webhook at %s", webhook_url)
     logger.info("Timezone offset: UTC+%s", TZ_OFFSET)
 
-    # run_webhook — синхронный, сам управляет event loop.
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
