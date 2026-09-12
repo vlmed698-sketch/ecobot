@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Телеграм-бот для учёта доходов и расходов за день.
-Поддерживает И inline-кнопки, И Reply-клавиатуру (нижнюю).
+Поддерживает И inline-кнопки, И Reply-клавиатуру.
+
+Особенности:
+- В личке команды /start, /menu, /summary, /history работают без @упоминания.
+- В группе — только с @BotUsername, чтобы не конфликтовать с другими ботами.
+- Inline- и Reply-кнопки работают в любом чате без упоминаний.
 
 Деплой на Railway:
 - TELEGRAM_BOT_TOKEN — токен бота
@@ -9,6 +14,7 @@
 - PORT — порт (подставляется автоматически)
 - DB_PATH — путь к SQLite (по умолчанию /data/expenses.db)
 - TZ_OFFSET — часовой пояс (по умолчанию 3, Москва)
+- BOT_USERNAME — имя бота без @ (например, Eco_medvedevbot)
 """
 
 import os
@@ -23,7 +29,6 @@ from telegram import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application,
@@ -37,6 +42,10 @@ from telegram.ext import (
 # ==================== НАСТРОЙКИ ====================
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+
+# Имя бота БЕЗ @. Нужно для фильтрации команд в группах.
+# Пример: если бот @Eco_medvedevbot — тут "Eco_medvedevbot".
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "Eco_medvedevbot").strip().lstrip("@")
 
 RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
@@ -54,13 +63,10 @@ LOCAL_TZ = timezone(timedelta(hours=TZ_OFFSET))
 EXPENSE_CATEGORIES = ["Еда", "Транспорт", "Жильё", "Развлечения", "Здоровье", "Другое"]
 INCOME_CATEGORIES = ["Зарплата", "Подработка", "Подарок", "Прочее"]
 
-# Тексты Reply-кнопок
 BTN_EXPENSE = "💸 Расход"
 BTN_INCOME = "💰 Доход"
 BTN_SUMMARY = "📊 Итог за сегодня"
 BTN_HISTORY = "🧾 История за сегодня"
-
-REPLY_BUTTONS = {BTN_EXPENSE, BTN_INCOME, BTN_SUMMARY, BTN_HISTORY}
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -137,7 +143,6 @@ def get_today_records(user_id: int):
 # ==================== КЛАВИАТУРЫ ====================
 
 def reply_keyboard():
-    """Нижняя Reply-клавиатура."""
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton(BTN_EXPENSE), KeyboardButton(BTN_INCOME)],
@@ -148,7 +153,6 @@ def reply_keyboard():
 
 
 def main_menu_keyboard():
-    """Inline-клавиатура под сообщением."""
     return InlineKeyboardMarkup(
         [
             [
@@ -193,10 +197,9 @@ async def safe_edit(query, text, reply_markup=None, parse_mode=None):
         logger.info("edit_message_text skipped: %s", e)
 
 
-# ==================== ЛОГИКА ДЕЙСТВИЙ (общая для inline и reply) ====================
+# ==================== ЛОГИКА ДЕЙСТВИЙ ====================
 
 async def action_start_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начать ввод расхода. Работает и из inline, и из reply."""
     clear_state(context)
     context.user_data["record_type"] = "expense"
     context.user_data["stage"] = "choosing_category"
@@ -235,7 +238,6 @@ async def action_start_income(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def action_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать итог. Работает и из inline, и из reply."""
     user_id = update.effective_user.id
     if update.callback_query:
         await update.callback_query.answer()
@@ -366,7 +368,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id, chat_type, text, dict(state),
     )
 
-    # --- 0. Reply-кнопки главного меню ---
+    # --- 0. Reply-кнопки ---
     if text == BTN_EXPENSE:
         await action_start_expense(update, context)
         return
@@ -522,11 +524,27 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_application() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu))
-    app.add_handler(CommandHandler("summary", summary_command))
-    app.add_handler(CommandHandler("history", history_command))
+    private = filters.ChatType.PRIVATE
+    group = filters.ChatType.GROUPS
+    # В группе команда должна содержать @BOT_USERNAME
+    mention = filters.Regex(rf"^/\w+@{re.escape(BOT_USERNAME)}\b")
+
+    # В личке — без упоминания
+    app.add_handler(CommandHandler("start", start, filters=private))
+    app.add_handler(CommandHandler("menu", menu, filters=private))
+    app.add_handler(CommandHandler("summary", summary_command, filters=private))
+    app.add_handler(CommandHandler("history", history_command, filters=private))
+
+    # В группах — только с @BOT_USERNAME
+    app.add_handler(CommandHandler("start", start, filters=group & mention))
+    app.add_handler(CommandHandler("menu", menu, filters=group & mention))
+    app.add_handler(CommandHandler("summary", summary_command, filters=group & mention))
+    app.add_handler(CommandHandler("history", history_command, filters=group & mention))
+
+    # Inline-кнопки работают везде
     app.add_handler(CallbackQueryHandler(on_callback))
+
+    # Текстовые сообщения (числа, Reply-кнопки, обычный текст)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     return app
@@ -552,6 +570,7 @@ def main():
 
     logger.info("Starting webhook at %s", webhook_url)
     logger.info("Timezone offset: UTC+%s", TZ_OFFSET)
+    logger.info("Bot username (for groups): @%s", BOT_USERNAME)
 
     app.run_webhook(
         listen="0.0.0.0",
