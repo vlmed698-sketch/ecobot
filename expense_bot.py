@@ -6,7 +6,7 @@
 Деплой на Railway:
 - Токен берётся из переменной окружения TELEGRAM_BOT_TOKEN.
 - Публичный домен — из RAILWAY_PUBLIC_DOMAIN.
-- Порт — из PORT (Railway подставляет автоматически).
+- Порт — из PORT.
 - База — по пути DB_PATH (по умолчанию /data/expenses.db, если смонтирован volume;
   иначе ./expenses.db).
 """
@@ -35,17 +35,13 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 
-# Railway автоматически подставляет публичный домен в RAILWAY_PUBLIC_DOMAIN.
 RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
-# Если домен не задан (локальный запуск), можно задать вручную через WEBHOOK_URL.
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
 
 WEBHOOK_PATH = "/webhook"
 PORT = int(os.environ.get("PORT", 8080))
 
-# Путь к БД: если смонтирован Railway Volume в /data — используем его.
 DB_PATH = os.environ.get("DB_PATH", "/data/expenses.db")
-# Fallback: если /data недоступен (например, локально), используем текущую папку.
 if not os.path.isdir(os.path.dirname(DB_PATH)):
     DB_PATH = "expenses.db"
 
@@ -146,6 +142,23 @@ def clear_state(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
 
+# ==================== ВСПОМОГАТЕЛЬНОЕ ====================
+
+async def safe_edit(query, text, reply_markup=None, parse_mode=None):
+    """
+    Безопасно редактирует сообщение.
+    Если текст не изменился или сообщение уже удалено — не падаем.
+    """
+    try:
+        await query.edit_message_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+    except Exception as e:
+        logger.info("edit_message_text skipped: %s", e)
+
+
 # ==================== ОБРАБОТЧИКИ ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -175,14 +188,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "cancel":
         clear_state(context)
         await query.answer("Отменено")
-        await query.edit_message_text("Отменено. Нажми /menu, чтобы начать заново.")
+        await safe_edit(query, "Отменено. Нажми /menu, чтобы начать заново.")
         return
 
     # --- Меню ---
     if data == "menu":
         clear_state(context)
         await query.answer()
-        await query.edit_message_text("Главное меню:", reply_markup=main_menu_keyboard())
+        await safe_edit(query, "Главное меню:", reply_markup=main_menu_keyboard())
         return
 
     # --- Начать расход ---
@@ -191,7 +204,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["record_type"] = "expense"
         state["stage"] = "choosing_category"
         await query.answer()
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             "На что потрачено? Выбери категорию:",
             reply_markup=categories_keyboard(EXPENSE_CATEGORIES, "cat_exp"),
         )
@@ -203,7 +217,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["record_type"] = "income"
         state["stage"] = "choosing_category"
         await query.answer()
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             "Откуда доход? Выбери категорию:",
             reply_markup=categories_keyboard(INCOME_CATEGORIES, "cat_inc"),
         )
@@ -220,7 +235,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rtype = state.get("record_type", "expense")
         label = "расход" if rtype == "expense" else "доход"
         await query.answer()
-        await query.edit_message_text(
+        await safe_edit(
+            query,
             f"Категория: <b>{category}</b>\n"
             f"Теперь отправь сообщением сумму {label}а — просто число, например <code>350</code>.",
             parse_mode="HTML",
@@ -234,26 +250,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Итог ---
     if data == "summary":
         await query.answer()
-        await query.edit_message_text(
-            "Главное меню:", reply_markup=main_menu_keyboard()
-        )
+        await safe_edit(query, "Главное меню:", reply_markup=main_menu_keyboard())
         await send_summary(query.message, user_id)
         return
 
     # --- История ---
     if data == "history":
         await query.answer()
-        await query.edit_message_text(
-            "Главное меню:", reply_markup=main_menu_keyboard()
-        )
+        await safe_edit(query, "Главное меню:", reply_markup=main_menu_keyboard())
         await send_history(query.message, user_id)
         return
 
-    await query.answer()
+    # --- Неизвестная кнопка (устаревшая от прошлой версии бота) ---
+    logger.warning("UNKNOWN callback data=%s user_id=%s", data, user_id)
+    await query.answer(
+        "Кнопка устарела. Открой /menu заново.",
+        show_alert=True,
+    )
 
 
 def try_parse_amount(text: str):
-    """Пытается распарсить число. Возвращает float или None."""
     try:
         amount = float(str(text).strip().replace(",", "."))
         if amount <= 0:
@@ -301,7 +317,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- Случай 2: нет активного шага, но это reply на сообщение-запрос бота ---
+    # --- Случай 2: reply на сообщение-запрос бота ---
     if amount is not None and update.message.reply_to_message:
         replied = update.message.reply_to_message
         me = await context.bot.get_me()
@@ -426,10 +442,7 @@ def main():
 
     logger.info("Starting webhook at %s", webhook_url)
 
-    # ВАЖНО:
-    # - run_webhook вызывается БЕЗ await и БЕЗ asyncio.run.
-    # - Это синхронный метод, он сам создаёт и держит event loop.
-    # - Он же слушает порт PORT — отдельный healthcheck-сервер НЕ нужен.
+    # run_webhook — синхронный, сам управляет event loop.
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
